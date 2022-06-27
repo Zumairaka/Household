@@ -11,7 +11,7 @@ pragma solidity ^0.8.0;
 
 interface IUniswapV2Factory {
     /**
-     * @dev this function is used to create a pair
+     * @notice this function is used to create a pair
      */
     function createPair(address tokenA, address tokenB)
         external
