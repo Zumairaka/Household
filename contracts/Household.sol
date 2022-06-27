@@ -75,13 +75,6 @@ contract Household is
         _;
     }
 
-    // ENUM
-    enum HouseholdRoles {
-        normal,
-        allowed,
-        special
-    }
-
     // MAPPINGS
     // mapping for checking the house hold member
     mapping(address => bool) private _isMember;
