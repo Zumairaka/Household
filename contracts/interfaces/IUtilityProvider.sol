@@ -23,4 +23,11 @@ interface IUtilityProvider {
      * @return amount returns the amount of stable coin that needs to be paid
      */
     function paymentRequired(address household) external returns (uint256);
+
+    /**
+     * @notice function for retrieving the due date for the payment
+     * @param household address of the household contract
+     * @return dueDate last date to make the payment
+     */
+    function getDueDate(address household) external returns (uint256);
 }

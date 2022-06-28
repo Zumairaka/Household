@@ -10,6 +10,7 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol"
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 
 /**
  * @author Sumaira K A
@@ -34,18 +35,14 @@ contract Household is
     address[] private _priceFeeds;
     // stable coin supported by the utility provider
     address private _utilityTokenAddress;
+    address private _utilityTokenPriceFeed;
     IERC20Upgradeable private _utilityToken;
-    // address of gas utility provider
-    address private _gasProviderAddress;
-    IUtilityProvider private _gasProvider;
-    // address of water utility provider
-    address private _waterProviderAddress;
-    IUtilityProvider private _waterProvider;
-    // address of electricity utility provider
-    address private _electricityProviderAddress;
-    IUtilityProvider private _electricityProvider;
     //address of priceAggregator
-    PriceAggregator private _priceAggregator;
+    PriceAggregator _priceAggregator;
+    // object for the uniswap factory
+    IUniswapV2Factory _uniswapFactory;
+    // object for the uniswap router
+    IUniswapV2Router02 _uinswapRouter;
 
     // EVENTS
     // event for informing the low balance of the token
@@ -70,8 +67,34 @@ contract Household is
     );
 
     // MODIFIERS
+    // modifier to check if an account is a member of the contract
     modifier onlyMember(address account) {
         require(_isMember[account] == true, "Household: not a member");
+        _;
+    }
+
+    // modifer to check if the token already exists
+    modifier tokenExists(address token) {
+        address[] memory cryptos = _cryptoPortfolio;
+        bool exists;
+
+        for (uint256 i; i < cryptos.length; i++) {
+            if (cryptos[i] == token) {
+                exists = true;
+                break;
+            }
+        }
+        require(exists == false, "Household: token exists");
+        _;
+    }
+
+    //modifier for checking the due date of the providers
+    modifier checkDate(address provider) {
+        require(
+            IUtilityProvider(provider).getDueDate(address(this)) >=
+                block.timestamp,
+            "Household: duedate over"
+        );
         _;
     }
 
@@ -95,11 +118,11 @@ contract Household is
      * setting utility token
      */
     function initialize(
-        address gasProvider_,
-        address waterProvider_,
-        address electricityProvider_,
         address priceAggregator_,
-        address utilityToken_
+        address utilityToken_,
+        address utilityTokenPriceFeed_,
+        address uniswapRouter_,
+        address uniswapFactory_
     ) public initializer {
         __ReentrancyGuard_init();
         __Ownable_init();
@@ -108,42 +131,30 @@ contract Household is
         _setupRole(ALLOWED_ROLE, _msgSender());
         _isMember[_msgSender()] = true;
 
-        _gasProviderAddress = gasProvider_;
-        _gasProvider = IUtilityProvider(gasProvider_);
-
-        _waterProviderAddress = waterProvider_;
-        _waterProvider = IUtilityProvider(waterProvider_);
-
-        _electricityProviderAddress = electricityProvider_;
-        _electricityProvider = IUtilityProvider(electricityProvider_);
-
         _priceAggregator = PriceAggregator(priceAggregator_);
 
         _utilityTokenAddress = utilityToken_;
+        _utilityTokenPriceFeed = utilityTokenPriceFeed_;
         _utilityToken = IERC20Upgradeable(utilityToken_);
+
+        _uniswapFactory = IUniswapV2Factory(uniswapFactory_);
+        _uinswapRouter = IUniswapV2Router02(uniswapRouter_);
     }
 
     /**
      * @notice function for registering to the utility providers
-     * @dev registering to each providers separately but they are
+     * @dev calling a private function {_register}
+     * @param provider_ address of the utility providers
      * @param name_ unique string to know where you live
-     * @return greg gas provider reg status
-     * @return wreg water provider reg status
-     * @return ereg electricity provider reg status
+     * @return status gas provider reg status
      * following the same interface {IUtilityProvider}
      */
-    function registerUtilities(string memory name_)
+    function registerUtilities(address provider_, string memory name_)
         external
         onlyOwner
-        returns (
-            bool greg,
-            bool wreg,
-            bool ereg
-        )
+        returns (bool status)
     {
-        greg = _gasProvider.registerHousehold(address(this), name_);
-        wreg = _waterProvider.registerHousehold(address(this), name_);
-        ereg = _electricityProvider.registerHousehold(address(this), name_);
+        status = _register(provider_, name_);
     }
 
     /**
@@ -174,17 +185,24 @@ contract Household is
     /**
      * @notice function for adding crypto currency to the portfolio
      * @dev only allowed member can do this
+     * @dev we need to create the pair for the uniswap market
+     * with the token we are adding with the utility token
      * @param token_ address of the token to be added
      * @param priceFeed_ oracle for the token to be added
      */
     function addCrypto(address token_, address priceFeed_)
         external
         onlyRole(ALLOWED_ROLE)
+        tokenExists(token_)
     {
         require(token_ != address(0), "Household: zero address");
 
         _cryptoPortfolio.push(token_);
         _priceFeeds.push(priceFeed_);
+
+        // create pair with the utility token
+        _uniswapFactory.createPair(token_, _utilityTokenAddress);
+
         emit CryptoAdded(token_, priceFeed_, _msgSender());
     }
 
@@ -236,6 +254,7 @@ contract Household is
     /**
      * @notice function for revoking the role of a member
      * @dev only creator can revoke role of a member
+     * @dev role cannot change for the creator
      * @param member_ address of the member to allocate a role
      * @param role_ role to be allocated
      */
@@ -248,6 +267,164 @@ contract Household is
             role_ == SPECIAL_ROLE || role_ == ALLOWED_ROLE,
             "Household: invalid role"
         );
+        require(member_ != owner(), "Household: cannot change for creator");
+
         _revokeRole(role_, member_);
+    }
+
+    /**
+     * @notice function for making payment to the utility providers
+     * @dev allowed only for the allowed members
+     * @dev we need to get the current rate of the token from the
+     * oracle and convert to the utility token using uniswap swap function
+     * @dev get the bill from the utility provider contract
+     * @dev get the due date from the utility provider and check if the
+     * date is over otherwise make the payment.
+     * @dev this is not taking any parameters
+     * @param provider address of the utility provider
+     * @return status status of gas payment
+     */
+    function payTheBills(address provider)
+        external
+        onlyRole(ALLOWED_ROLE)
+        checkDate(provider)
+        returns (bool status)
+    {
+        // get the bill for the providers
+        uint256 amount = getTheBill(provider);
+
+        // get the latest rate for each token and use the lowest one
+        // so that we can pay less amount as swapping fee
+        (
+            address paymentToken,
+            int256 price,
+            uint8 decimal
+        ) = _getPaymentToken();
+
+        // if the payment token is utility token itself then we
+        // dont need to swap
+        if (paymentToken == _utilityTokenAddress) {
+            require(
+                _utilityToken.balanceOf(address(this)) >= amount,
+                "Household: insufficient balance"
+            );
+            // transfer the bill to the utility provider
+            status = _utilityToken.transfer(provider, amount);
+        } else {
+            // we need to fetch the current price of the utility token
+            // and find the equivalent amount of payment token
+            int256 utilityPrice = _priceAggregator.getLatestPrice(
+                _utilityTokenPriceFeed
+            );
+            uint256 paymentTokenAmount = (uint256(utilityPrice) *
+                amount *
+                uint256(decimal)) /
+                (uint256(_priceAggregator.decimals(_utilityTokenPriceFeed)) *
+                    uint256(price));
+            // uniswap swapping fee is 0.3%. So we need to calculate the
+            // fee and add this amount to the amountIn in uniswap swapping function
+            uint256 amountIn = ((paymentTokenAmount * 3000) / 10**6) +
+                paymentTokenAmount;
+
+            // call the uniswap swapping function
+            uint256[] memory swappedAmounts = _getSwappedAmount(
+                amount,
+                amountIn,
+                paymentToken
+            );
+
+            // make the payment using swappedAmounts[1]
+            status = _utilityToken.transfer(provider, swappedAmounts[1]);
+        }
+    }
+
+    /**
+     * @notice internal function for returning the bill amount
+     * @dev internal function to call the provider interface and retrieve amount
+     * @param provider provider address
+     * @return amount the bill amount
+     */
+    function getTheBill(address provider) internal returns (uint256 amount) {
+        amount = IUtilityProvider(provider).paymentRequired(address(this));
+    }
+
+    /**
+     * @notice private function for returning the bill amount
+     * @dev internal function to call the provider interface and retrieve amount
+     * @param provider provider address
+     * @param name unique name represents where the house hold live
+     * @return status status of the registeration
+     */
+
+    function _register(address provider, string memory name)
+        private
+        returns (bool status)
+    {
+        status = IUtilityProvider(provider).registerHousehold(
+            address(this),
+            name
+        );
+    }
+
+    /**
+     * @notice private function for fetching the latest price for each token
+     * from the oracle and return the best token
+     * @dev use different pricefeed for different tokens
+     * @return paymentToken return the lowest priced token
+     * @return price price of payment token in dollars
+     * @return decimal decimals of the particular token
+     */
+    function _getPaymentToken()
+        private
+        view
+        returns (
+            address paymentToken,
+            int256 price,
+            uint8 decimal
+        )
+    {
+        address[] memory cryptos = _cryptoPortfolio;
+        address[] memory oracles = _priceFeeds;
+        price = _priceAggregator.getLatestPrice(oracles[0]);
+
+        for (uint256 i = 1; i < cryptos.length; i++) {
+            int256 tokenPrice = _priceAggregator.getLatestPrice(oracles[i]);
+            if (tokenPrice < price) {
+                price = tokenPrice;
+                paymentToken = cryptos[i];
+                decimal = _priceAggregator.decimals(cryptos[i]);
+            }
+        }
+    }
+
+    /**
+     * @notice private function for swapping the payment token wrt the utility token
+     * @dev amountOut is utility token and amount of payment token is amountIn
+     * @param amountOut utility token amount
+     * @param amountIn payment token amount
+     * @param paymentToken paymentToken address
+     * @return swappedAmounts array of amountIn followed by amountOuts
+     */
+    function _getSwappedAmount(
+        uint256 amountOut,
+        uint256 amountIn,
+        address paymentToken
+    ) private returns (uint256[] memory swappedAmounts) {
+        address[] memory path = new address[](2);
+        path[0] = paymentToken;
+        path[1] = _utilityTokenAddress;
+
+        // approve to transfer the token to the uniswap
+        IERC20Upgradeable(paymentToken).approve(
+            address(_uinswapRouter),
+            amountIn
+        );
+        swappedAmounts = _uinswapRouter.swapTokensForExactTokens(
+            amountOut,
+            amountIn,
+            path,
+            address(this),
+            block.timestamp + 1 days
+        );
     }
 }
