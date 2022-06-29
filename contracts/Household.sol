@@ -34,9 +34,8 @@ contract Household is
     // pricefeed oracle address for each crypto
     address[] private _priceFeeds;
     // stable coin supported by the utility provider
-    address private _utilityTokenAddress;
+    address private _utilityToken;
     address private _utilityTokenPriceFeed;
-    IERC20Upgradeable private _utilityToken;
     //address of priceAggregator
     PriceAggregator _priceAggregator;
     // object for the uniswap factory
@@ -109,13 +108,11 @@ contract Household is
     bytes32 private constant ALLOWED_ROLE = keccak256("ALLOWED_ROLE");
 
     /**
-     * initializer instead of constructor
-     * setting all the utility providers
-     * setting both roles to the creator
-     * intializing creator as owner
-     * making the creator a member
-     * setting price aggregator
-     * setting utility token
+     * @dev initializer instead of constructor
+     * @dev setting utility token and pricefeed
+     * @dev setting both roles to the creator
+     * @dev intializing creator as owner
+     * @dev making the creator a member
      */
     function initialize(
         address priceAggregator_,
@@ -133,9 +130,8 @@ contract Household is
 
         _priceAggregator = PriceAggregator(priceAggregator_);
 
-        _utilityTokenAddress = utilityToken_;
+        _utilityToken = utilityToken_;
         _utilityTokenPriceFeed = utilityTokenPriceFeed_;
-        _utilityToken = IERC20Upgradeable(utilityToken_);
 
         _uniswapFactory = IUniswapV2Factory(uniswapFactory_);
         _uinswapRouter = IUniswapV2Router02(uniswapRouter_);
@@ -143,7 +139,7 @@ contract Household is
 
     /**
      * @notice function for registering to the utility providers
-     * @dev calling a private function {_register}
+     * @dev calling a function using the {IUtilityProvider} interface
      * @param provider_ address of the utility providers
      * @param name_ unique string to know where you live
      * @return status gas provider reg status
@@ -154,7 +150,10 @@ contract Household is
         onlyOwner
         returns (bool status)
     {
-        status = _register(provider_, name_);
+        status = IUtilityProvider(provider_).registerHousehold(
+            address(this),
+            name_
+        );
     }
 
     /**
@@ -201,7 +200,7 @@ contract Household is
         _priceFeeds.push(priceFeed_);
 
         // create pair with the utility token
-        _uniswapFactory.createPair(token_, _utilityTokenAddress);
+        _uniswapFactory.createPair(token_, _utilityToken);
 
         emit CryptoAdded(token_, priceFeed_, _msgSender());
     }
@@ -281,17 +280,15 @@ contract Household is
      * @dev get the due date from the utility provider and check if the
      * date is over otherwise make the payment.
      * @dev this is not taking any parameters
-     * @param provider address of the utility provider
-     * @return status status of gas payment
+     * @param provider_ address of the utility provider
      */
-    function payTheBills(address provider)
+    function payTheBills(address provider_)
         external
         onlyRole(ALLOWED_ROLE)
-        checkDate(provider)
-        returns (bool status)
+        checkDate(provider_)
     {
         // get the bill for the providers
-        uint256 amount = getTheBill(provider);
+        uint256 amount = getTheBill(provider_);
 
         // get the latest rate for each token and use the lowest one
         // so that we can pay less amount as swapping fee
@@ -303,13 +300,17 @@ contract Household is
 
         // if the payment token is utility token itself then we
         // dont need to swap
-        if (paymentToken == _utilityTokenAddress) {
+        if (paymentToken == _utilityToken) {
             require(
-                _utilityToken.balanceOf(address(this)) >= amount,
+                IERC20Upgradeable(_utilityToken).balanceOf(address(this)) >=
+                    amount,
                 "Household: insufficient balance"
             );
+
+            // emit the event for making payment
+            emit PaymentDone(provider_, amount);
             // transfer the bill to the utility provider
-            status = _utilityToken.transfer(provider, amount);
+            IERC20Upgradeable(_utilityToken).safeTransfer(provider_, amount);
         } else {
             // we need to fetch the current price of the utility token
             // and find the equivalent amount of payment token
@@ -326,6 +327,9 @@ contract Household is
             uint256 amountIn = ((paymentTokenAmount * 3000) / 10**6) +
                 paymentTokenAmount;
 
+            // check for the balance of the portfolio for this token amount
+            _checkBalance(paymentToken, amountIn, price, decimal);
+
             // call the uniswap swapping function
             uint256[] memory swappedAmounts = _getSwappedAmount(
                 amount,
@@ -333,9 +337,51 @@ contract Household is
                 paymentToken
             );
 
+            // emit the event for making payment
+            emit PaymentDone(provider_, amount);
+
             // make the payment using swappedAmounts[1]
-            status = _utilityToken.transfer(provider, swappedAmounts[1]);
+            IERC20Upgradeable(_utilityToken).safeTransfer(
+                provider_,
+                swappedAmounts[1]
+            );
         }
+    }
+
+    /**
+     * @notice this function is for changing the utility token address
+     * @dev we need to change the price feed for the utility token also
+     * @dev if the pricefeed is same as before no need to change
+     * @dev or if the token is same and pricefeed has to change
+     * @param token_ new address of the utility token address
+     * @param priceFeed_ for the new token or new pricefeed of old token
+     * nothin is returning. emitting an event {UtilityTokenChanged}
+     */
+    function changeUtilityPayment(address token_, address priceFeed_)
+        external
+        onlyOwner
+    {
+        require(
+            token_ != _utilityToken || priceFeed_ != _utilityTokenPriceFeed,
+            "Household: existing token"
+        );
+        _utilityToken = token_;
+        _utilityTokenPriceFeed = priceFeed_;
+    }
+
+    /**
+     * @notice function for retrieving the crypto portfolio and pricefeeds
+     * @dev anyone can use this function
+     * @dev no parameters
+     * @return cryptoPortfolio array of portfolio
+     * @return priceFeeds array of price feeds
+     */
+    function getCryptoPortfolio()
+        external
+        view
+        returns (address[] memory cryptoPortfolio, address[] memory priceFeeds)
+    {
+        return (_cryptoPortfolio, _priceFeeds);
     }
 
     /**
@@ -346,24 +392,6 @@ contract Household is
      */
     function getTheBill(address provider) internal returns (uint256 amount) {
         amount = IUtilityProvider(provider).paymentRequired(address(this));
-    }
-
-    /**
-     * @notice private function for returning the bill amount
-     * @dev internal function to call the provider interface and retrieve amount
-     * @param provider provider address
-     * @param name unique name represents where the house hold live
-     * @return status status of the registeration
-     */
-
-    function _register(address provider, string memory name)
-        private
-        returns (bool status)
-    {
-        status = IUtilityProvider(provider).registerHousehold(
-            address(this),
-            name
-        );
     }
 
     /**
@@ -412,7 +440,7 @@ contract Household is
     ) private returns (uint256[] memory swappedAmounts) {
         address[] memory path = new address[](2);
         path[0] = paymentToken;
-        path[1] = _utilityTokenAddress;
+        path[1] = _utilityToken;
 
         // approve to transfer the token to the uniswap
         IERC20Upgradeable(paymentToken).approve(
@@ -426,5 +454,35 @@ contract Household is
             address(this),
             block.timestamp + 1 days
         );
+    }
+
+    /**
+     * @notice function for checking the balance, if not enough balance
+     * then revert otherwise will check for the remaining balance
+     * @dev if the remaining balance is less than 50 dollar then it will
+     * emit an event to inform the low balance
+     * @param paymentToken token in which payment is done
+     * @param payment number of tokens going to swap for
+     * converting to utility token for making the payment
+     * @param price price in dollar per token
+     * @param decimal decimal of the token
+     */
+
+    function _checkBalance(
+        address paymentToken,
+        uint256 payment,
+        int256 price,
+        uint8 decimal
+    ) private {
+        uint256 balance = IERC20Upgradeable(paymentToken).balanceOf(
+            address(this)
+        );
+        require(balance >= payment, "Household: low balance");
+
+        // find the balance after deducting the payment
+        balance -= payment;
+        if ((balance * uint256(price)) / uint256(decimal) < 50) {
+            emit LowBalance(paymentToken, balance);
+        }
     }
 }
