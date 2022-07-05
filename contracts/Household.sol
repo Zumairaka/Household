@@ -100,6 +100,8 @@ contract Household is
     // MAPPINGS
     // mapping for checking the house hold member
     mapping(address => bool) private _isMember;
+    mapping(address => bool) private _doesTokenExist;
+    mapping(address => bool) private _doesPricefeedExist;
 
     // ACCESS ROLES
     // special role
@@ -145,12 +147,11 @@ contract Household is
      * @return status gas provider reg status
      * following the same interface {IUtilityProvider}
      */
-    function registerUtilities(address provider_, string memory name_)
+    function registerHousehold(address provider_, string memory name_)
         external
         onlyOwner
-        returns (bool status)
     {
-        status = IUtilityProvider(provider_).registerHousehold(
+        super.registerHousehold(
             address(this),
             name_
         );
@@ -211,25 +212,35 @@ contract Household is
      * @dev we need to remove a token from the portfolio and resize the array
      * @param tokenIndex_ address of the token to be removed
      */
-    function removeCrypto(uint8 tokenIndex_) external onlyRole(ALLOWED_ROLE) {
+    function removeCrypto(address token_, address priceFeed_)
+        external
+        onlyRole(ALLOWED_ROLE)
+    {
         require(
-            tokenIndex_ <= _cryptoPortfolio.length - 1,
-            "Household: invalid index"
+            _doesTokenExist[token_] == true,
+            "Household: token does not exist"
         );
-        address[] memory cryptos = _cryptoPortfolio;
-        address[] memory oracles = _priceFeeds;
-        address token = cryptos[tokenIndex_];
-        address priceFeed = oracles[tokenIndex_];
 
-        cryptos[tokenIndex_] = cryptos[cryptos.length - 1];
-        delete cryptos[cryptos.length - 1];
+        _doesTokenExist[token_] = false;
+        _doesPricefeedExist[priceFeed_] = false;
+        // require(
+        //     tokenIndex_ <= _cryptoPortfolio.length - 1,
+        //     "Household: invalid index"
+        // );
+        // address[] memory cryptos = _cryptoPortfolio;
+        // address[] memory oracles = _priceFeeds;
+        // address token = cryptos[tokenIndex_];
+        // address priceFeed = oracles[tokenIndex_];
 
-        oracles[tokenIndex_] = oracles[oracles.length - 1];
-        delete oracles[oracles.length - 1];
+        // cryptos[tokenIndex_] = cryptos[cryptos.length - 1];
+        // delete cryptos[cryptos.length - 1];
 
-        _cryptoPortfolio = cryptos;
-        _priceFeeds = oracles;
-        emit CryptoRemoved(token, priceFeed, _msgSender());
+        // oracles[tokenIndex_] = oracles[oracles.length - 1];
+        // delete oracles[oracles.length - 1];
+
+        // _cryptoPortfolio = cryptos;
+        // _priceFeeds = oracles;
+        emit CryptoRemoved(token_, priceFeed_, _msgSender());
     }
 
     /**
